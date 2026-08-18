@@ -4,15 +4,18 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "esp_http_server.h"
+
+// --- FREERTOS INCLUDES ---
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
-// WI-FI CREDENTIALS
+// 1. WI-FI CREDENTIALS
 const char* ssid = "HH40_6CA7-2.4";
 const char* password = "80028244";
 
-// OLED DISPLAY SETTINGS
+// 2. OLED DISPLAY SETTINGS
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
@@ -20,7 +23,7 @@ const char* password = "80028244";
 #define SCL_PIN 2
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// CAMERA PINS (Freenove ESP32-S3)
+// 3. CAMERA PINS (Freenove ESP32-S3)
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  15
@@ -39,11 +42,47 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define PCLK_GPIO_NUM  13
 
 // --- FREERTOS GLOBALS ---
-QueueHandle_t moveQueue; // Queue to pass strings from Core 0 (Web) to Core 1 (OLED)
-#define HEALTH_LED_PIN 2 // Built-in LED on most ESP32 boards
+QueueHandle_t moveQueue; 
+SemaphoreHandle_t manualMoveMutex; // Mutex to protect the manual move string
+#define HEALTH_LED_PIN 2 
+
+char pendingManualMove[50] = ""; // Stores the move entered on the phone
 
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t command_httpd = NULL;
+
+
+// ==========================================
+// FALLBACK WEB APP HTML (Stored in Flash)
+// ==========================================
+const char* fallback_html = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; background-color: #222; color: white; }
+  input, button { font-size: 24px; padding: 15px; margin: 10px; border-radius: 8px; border: none; }
+  button { background-color: #4CAF50; color: white; font-weight: bold; cursor: pointer; }
+  input { text-align: center; width: 60%; }
+</style>
+</head><body>
+  <h2>Chess Fallback Mode</h2>
+  <p>Camera offline. Enter move manually:</p>
+  <input type="text" id="move" placeholder="e.g. e2e4" maxlength="5">
+  <br><button onclick="sendMove()">Submit Move</button>
+  <p id="status"></p>
+  <script>
+    function sendMove() {
+      var m = document.getElementById("move").value;
+      if(m.length < 4) return;
+      document.getElementById("status").innerText = "Sending...";
+      fetch("/submit_move?text=" + m).then(r => r.text()).then(t => {
+        document.getElementById("status").innerText = "Move " + m + " sent to Engine!";
+        document.getElementById("move").value = "";
+      });
+    }
+  </script>
+</body></html>
+)rawliteral";
+
 
 // ==========================================
 // CORE 0: NETWORKING & STREAMING TASKS
@@ -108,18 +147,15 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return res;
 }
 
+// Endpoint: Python sends moves or commands to the ESP32
 static esp_err_t move_handler(httpd_req_t *req) {
     char buf[100];
-    int ret, len = httpd_req_get_url_query_len(req) + 1;
+    int len = httpd_req_get_url_query_len(req) + 1;
     if (len > 1) {
         if (httpd_req_get_url_query_str(req, buf, len) == ESP_OK) {
             char param[50];
             if (httpd_query_key_value(buf, "text", param, sizeof(param)) == ESP_OK) {
-                if (xQueueSend(moveQueue, param, (TickType_t)10) != pdPASS) {
-                    Serial.println("Queue is full! Dropping move.");
-                } else {
-                    Serial.printf("Pushed to queue: %s\n", param);
-                }
+                xQueueSend(moveQueue, param, (TickType_t)10);
             }
         }
     }
@@ -127,35 +163,81 @@ static esp_err_t move_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Endpoint: Serves the HTML Fallback App to the phone
+static esp_err_t root_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, fallback_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Endpoint: Phone submits a manual move
+static esp_err_t submit_handler(httpd_req_t *req) {
+    char buf[100];
+    int len = httpd_req_get_url_query_len(req) + 1;
+    if (len > 1) {
+        if (httpd_req_get_url_query_str(req, buf, len) == ESP_OK) {
+            char param[50];
+            if (httpd_query_key_value(buf, "text", param, sizeof(param)) == ESP_OK) {
+                
+                // Lock the mutex, write the move, unlock the mutex
+                if(xSemaphoreTake(manualMoveMutex, (TickType_t)10) == pdTRUE) {
+                    strcpy(pendingManualMove, param);
+                    xSemaphoreGive(manualMoveMutex);
+                }
+
+                // Show the user's manual move on the OLED
+                char displayMsg[50];
+                snprintf(displayMsg, sizeof(displayMsg), "Manual: %s", param);
+                xQueueSend(moveQueue, displayMsg, (TickType_t)10);
+            }
+        }
+    }
+    httpd_resp_send(req, "Move Received", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Endpoint: Python polls this to ask "Did the user type a move on their phone?"
+static esp_err_t get_move_handler(httpd_req_t *req) {
+    char response[50] = "NONE";
+    
+    if(xSemaphoreTake(manualMoveMutex, (TickType_t)10) == pdTRUE) {
+        if(strlen(pendingManualMove) > 0) {
+            strcpy(response, pendingManualMove);
+            pendingManualMove[0] = '\0'; // Clear it after reading
+        }
+        xSemaphoreGive(manualMoveMutex);
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  
   config.core_id = 0; 
   
-  // --- SERVER 1: TEXT COMMANDS (Port 80) ---
+  // --- SERVER 1: TEXT COMMANDS & WEB APP (Port 80) ---
   config.server_port = 80;
   config.ctrl_port = 32768; 
   
-  httpd_uri_t move_uri = {
-    .uri       = "/move",
-    .method    = HTTP_GET,
-    .handler   = move_handler,
-    .user_ctx  = NULL
-  };
+  httpd_uri_t move_uri = { .uri = "/move", .method = HTTP_GET, .handler = move_handler, .user_ctx = NULL };
+  httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_handler, .user_ctx = NULL };
+  httpd_uri_t submit_uri = { .uri = "/submit_move", .method = HTTP_GET, .handler = submit_handler, .user_ctx = NULL };
+  httpd_uri_t get_uri = { .uri = "/get_move", .method = HTTP_GET, .handler = get_move_handler, .user_ctx = NULL };
+
   if (httpd_start(&command_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(command_httpd, &move_uri);
+    httpd_register_uri_handler(command_httpd, &root_uri);
+    httpd_register_uri_handler(command_httpd, &submit_uri);
+    httpd_register_uri_handler(command_httpd, &get_uri);
   }
 
   // --- SERVER 2: VIDEO STREAM (Port 81) ---
   config.server_port = 81;
   config.ctrl_port = 32769; 
   
-  httpd_uri_t stream_uri = {
-    .uri       = "/",
-    .method    = HTTP_GET,
-    .handler   = stream_handler,
-    .user_ctx  = NULL
-  };
+  httpd_uri_t stream_uri = { .uri = "/", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
   }
@@ -165,24 +247,28 @@ void startCameraServer() {
 // CORE 1: HARDWARE & UI TASKS
 // ==========================================
 
-// Task to handle OLED updates
 void oledUpdateTask(void *pvParameters) {
     char incomingMove[50];
-    
-    // Infinite FreeRTOS task loop
+
     while(1) {
-        // Block indefinitely until a message appears in the queue
         if (xQueueReceive(moveQueue, &incomingMove, portMAX_DELAY) == pdPASS) {
             display.fillRect(0, 32, 128, 32, BLACK); 
             display.setCursor(0, 40);
-            display.setTextSize(2);
-            display.println(incomingMove);
+            
+            // Check if Python sent the "Camera Offline" command
+            if (strncmp(incomingMove, "CMD:MANUAL", 10) == 0) {
+                display.setTextSize(1);
+                display.println("CAM OFFLINE. Go to:");
+                display.println(WiFi.localIP()); // Tells the user where to point their phone
+            } else {
+                display.setTextSize(2);
+                display.println(incomingMove);
+            }
             display.display();
         }
     }
 }
 
-// Hardware heartbeat to prove system isn't frozen
 void healthLedTask(void *pvParameters) {
     pinMode(HEALTH_LED_PIN, OUTPUT);
     while(1) {
@@ -201,38 +287,20 @@ void healthLedTask(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
   Wire.begin(SDA_PIN, SCL_PIN);
-  
-  // Initialize Queue (Holds up to 5 move strings of 50 chars each)
+
+  // Initialize FreeRTOS Objects
   moveQueue = xQueueCreate(5, sizeof(char) * 50);
-  if(moveQueue == NULL){
-    Serial.println("Error creating the queue");
-  }
+  manualMoveMutex = xSemaphoreCreateMutex();
 
   // Start Hardware UI Tasks pinned to Core 1
-  xTaskCreatePinnedToCore(
-      oledUpdateTask,   // Task function
-      "OLED Task",      // Name of task
-      4096,             // Stack size (bytes)
-      NULL,             // Parameter to pass
-      1,                // Task priority
-      NULL,             // Task handle
-      1);               // Pin to core 1
+  xTaskCreatePinnedToCore(oledUpdateTask, "OLED Task", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(healthLedTask, "Health LED Task", 1024, NULL, 1, NULL, 1);
 
-  xTaskCreatePinnedToCore(
-      healthLedTask,    
-      "Health LED Task",
-      1024,             
-      NULL,             
-      1,                
-      NULL,             
-      1);               
-
-  // Standard Setup (OLED, WiFi, Camera)
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
     Serial.println("OLED allocation failed");
     for(;;);
   }
-  
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(WHITE);
@@ -272,11 +340,8 @@ void setup() {
   config.fb_count = 2;
 
   esp_camera_init(&config);
-  
-  // Start Networking (Pinned to Core 0 inside the function)
   startCameraServer();
 
-  // Print initial UI
   display.clearDisplay();
   display.setCursor(0,0);
   display.setTextSize(1);
