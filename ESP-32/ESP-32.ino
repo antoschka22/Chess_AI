@@ -4,12 +4,15 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "esp_http_server.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
-// 1. UPDATE YOUR WI-FI CREDENTIALS HERE
+// WI-FI CREDENTIALS
 const char* ssid = "HH40_6CA7-2.4";
 const char* password = "80028244";
 
-// 2. OLED DISPLAY SETTINGS
+// OLED DISPLAY SETTINGS
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
@@ -17,7 +20,7 @@ const char* password = "80028244";
 #define SCL_PIN 2
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// 3. FREENOVE ESP32-S3 CAMERA PINS
+// CAMERA PINS (Freenove ESP32-S3)
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  15
@@ -35,9 +38,17 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define HREF_GPIO_NUM  7
 #define PCLK_GPIO_NUM  13
 
-httpd_handle_t stream_httpd = NULL;
+// --- FREERTOS GLOBALS ---
+QueueHandle_t moveQueue; // Queue to pass strings from Core 0 (Web) to Core 1 (OLED)
+#define HEALTH_LED_PIN 2 // Built-in LED on most ESP32 boards
 
-// 4. VIDEO STREAMING SERVER LOGIC
+httpd_handle_t stream_httpd = NULL;
+httpd_handle_t command_httpd = NULL;
+
+// ==========================================
+// CORE 0: NETWORKING & STREAMING TASKS
+// ==========================================
+
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
@@ -97,7 +108,6 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return res;
 }
 
-// --- NEW CODE: HTTP ENDPOINT TO RECEIVE MOVES ---
 static esp_err_t move_handler(httpd_req_t *req) {
     char buf[100];
     int ret, len = httpd_req_get_url_query_len(req) + 1;
@@ -105,13 +115,11 @@ static esp_err_t move_handler(httpd_req_t *req) {
         if (httpd_req_get_url_query_str(req, buf, len) == ESP_OK) {
             char param[50];
             if (httpd_query_key_value(buf, "text", param, sizeof(param)) == ESP_OK) {
-                // Wipe the bottom half of the screen and print the new move
-                display.fillRect(0, 32, 128, 32, BLACK); 
-                display.setCursor(0, 40);
-                display.setTextSize(2);
-                display.println(param);
-                display.display();
-                Serial.printf("Received move: %s\n", param);
+                if (xQueueSend(moveQueue, param, (TickType_t)10) != pdPASS) {
+                    Serial.println("Queue is full! Dropping move.");
+                } else {
+                    Serial.printf("Pushed to queue: %s\n", param);
+                }
             }
         }
     }
@@ -119,14 +127,14 @@ static esp_err_t move_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-httpd_handle_t command_httpd = NULL; // Add this new handle
-
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   
+  config.core_id = 0; 
+  
   // --- SERVER 1: TEXT COMMANDS (Port 80) ---
   config.server_port = 80;
-  config.ctrl_port = 32768; // Default control port
+  config.ctrl_port = 32768; 
   
   httpd_uri_t move_uri = {
     .uri       = "/move",
@@ -134,14 +142,13 @@ void startCameraServer() {
     .handler   = move_handler,
     .user_ctx  = NULL
   };
-  
   if (httpd_start(&command_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(command_httpd, &move_uri);
   }
 
   // --- SERVER 2: VIDEO STREAM (Port 81) ---
   config.server_port = 81;
-  config.ctrl_port = 32769; // Shift control port so they don't clash!
+  config.ctrl_port = 32769; 
   
   httpd_uri_t stream_uri = {
     .uri       = "/",
@@ -149,17 +156,78 @@ void startCameraServer() {
     .handler   = stream_handler,
     .user_ctx  = NULL
   };
-  
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
   }
 }
 
-// 5. MAIN SETUP
+// ==========================================
+// CORE 1: HARDWARE & UI TASKS
+// ==========================================
+
+// Task to handle OLED updates
+void oledUpdateTask(void *pvParameters) {
+    char incomingMove[50];
+    
+    // Infinite FreeRTOS task loop
+    while(1) {
+        // Block indefinitely until a message appears in the queue
+        if (xQueueReceive(moveQueue, &incomingMove, portMAX_DELAY) == pdPASS) {
+            display.fillRect(0, 32, 128, 32, BLACK); 
+            display.setCursor(0, 40);
+            display.setTextSize(2);
+            display.println(incomingMove);
+            display.display();
+        }
+    }
+}
+
+// Hardware heartbeat to prove system isn't frozen
+void healthLedTask(void *pvParameters) {
+    pinMode(HEALTH_LED_PIN, OUTPUT);
+    while(1) {
+        digitalWrite(HEALTH_LED_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        digitalWrite(HEALTH_LED_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(1900));
+    }
+}
+
+
+// ==========================================
+// MAIN SETUP
+// ==========================================
+
 void setup() {
   Serial.begin(115200);
   Wire.begin(SDA_PIN, SCL_PIN);
   
+  // Initialize Queue (Holds up to 5 move strings of 50 chars each)
+  moveQueue = xQueueCreate(5, sizeof(char) * 50);
+  if(moveQueue == NULL){
+    Serial.println("Error creating the queue");
+  }
+
+  // Start Hardware UI Tasks pinned to Core 1
+  xTaskCreatePinnedToCore(
+      oledUpdateTask,   // Task function
+      "OLED Task",      // Name of task
+      4096,             // Stack size (bytes)
+      NULL,             // Parameter to pass
+      1,                // Task priority
+      NULL,             // Task handle
+      1);               // Pin to core 1
+
+  xTaskCreatePinnedToCore(
+      healthLedTask,    
+      "Health LED Task",
+      1024,             
+      NULL,             
+      1,                
+      NULL,             
+      1);               
+
+  // Standard Setup (OLED, WiFi, Camera)
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
     Serial.println("OLED allocation failed");
     for(;;);
@@ -196,23 +264,19 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  // Keep the faster 20MHz clock speed
   config.xclk_freq_hz = 20000000;
-  
   config.frame_size = FRAMESIZE_VGA; 
-  
-  // YUV422 is faster for the ESP32 CPU to convert to JPEG than RGB565
   config.pixel_format = PIXFORMAT_YUV422; 
-  
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.fb_count = 2;
-  // (Note: config.jpeg_quality does nothing here since we aren't using PIXFORMAT_JPEG)
 
   esp_camera_init(&config);
+  
+  // Start Networking (Pinned to Core 0 inside the function)
   startCameraServer();
 
-  // Print initial UI to OLED
+  // Print initial UI
   display.clearDisplay();
   display.setCursor(0,0);
   display.setTextSize(1);
@@ -226,5 +290,5 @@ void setup() {
 }
 
 void loop() {
-  delay(10000); 
+  vTaskDelete(NULL); 
 }
