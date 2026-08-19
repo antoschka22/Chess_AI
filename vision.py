@@ -6,7 +6,7 @@ import chess.engine
 import numpy as np
 
 # --- CONFIGURATION ---
-ESP_IP = "192.168.0.54"
+ESP_IP = "" # ENTER YOUR ESP32 IP ADDRESS
 STREAM_URL = f"http://{ESP_IP}:81/"
 COMMAND_URL = f"http://{ESP_IP}:80"
 STOCKFISH_PATH = "./jstockfish.exe" # Path to your Stockfish binary

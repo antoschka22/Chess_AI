@@ -12,8 +12,8 @@
 #include "freertos/semphr.h"
 
 // 1. WI-FI CREDENTIALS
-const char* ssid = "HH40_6CA7-2.4";
-const char* password = "80028244";
+const char* ssid = ""; // ENTER YOUR WIFI SSID
+const char* password = ""; // ENTER YOUR WIFI PASSWORD
 
 // 2. OLED DISPLAY SETTINGS
 #define SCREEN_WIDTH 128
